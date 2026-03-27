@@ -100,7 +100,67 @@ for loop = 1:numLoops
     va_data(:, :, loop) = [tx0_rev; tx2_rev];
 end
 
-% 步骤4：固定距离bin + MVDR估角，再用估计角进行CBF波束成形
+
+%% 第一帧MVDR Range-Angle图（仅显示，不改变后续处理链路）
+ra_ang_scan = -60:0.5:60;
+RangFFT_ra = 512;
+diag_load_alpha_ra = 0.1;
+
+% 第一帧对应的loop索引（每帧64个loop）
+loops_per_frame = 64;
+frame1_idx = 1:loops_per_frame;
+
+% 距离轴（米）
+detaR_fft_ra = c / (2 * slope * ts) / RangFFT_ra * numADCSamples;
+range_axis_ra = (0:RangFFT_ra-1) * detaR_fft_ra;
+
+% 第一帧距离FFT数据：Xr_all [RangFFT_ra, 8, 64]
+hann_win_ra = hann(numADCSamples);
+Xr_all = zeros(RangFFT_ra, 8, loops_per_frame);
+for ii = 1:loops_per_frame
+    loop_id = frame1_idx(ii);
+    x_in = va_data(:, :, loop_id).';                         % [numADCSamples, 8]
+    x_win = x_in .* repmat(hann_win_ra, 1, 8);
+    Xr_all(:, :, ii) = fft(x_win, RangFFT_ra, 1);           % [RangFFT_ra, 8]
+end
+
+% 第一帧慢时间去静态：每个[距离bin, 天线]减去64个loop均值
+Xr_mean = mean(Xr_all, 3);
+Xr_all = Xr_all - repmat(Xr_mean, 1, 1, loops_per_frame);
+
+% 逐距离bin计算MVDR/Capon角谱
+n_ra = (0:7).';
+RA_mvdr = zeros(RangFFT_ra, numel(ra_ang_scan));
+for rb = 2:RangFFT_ra
+    Rxx_sum_ra = zeros(8, 8);
+    for ii = 1:loops_per_frame
+        x_bin = squeeze(Xr_all(rb, :, ii)).';               % [8, 1]
+        Rxx_sum_ra = Rxx_sum_ra + (x_bin * x_bin');
+    end
+    Rxx_ra = Rxx_sum_ra / loops_per_frame;
+
+    diag_load_ra = diag_load_alpha_ra * real(trace(Rxx_ra)) / 8;
+    Rxx_loaded_ra = Rxx_ra + diag_load_ra * eye(8);
+
+    for k = 1:numel(ra_ang_scan)
+        a_ra = exp(-1j * pi * n_ra * sin(ra_ang_scan(k) * pi / 180));
+        RA_mvdr(rb, k) = 1 / real(a_ra' * (Rxx_loaded_ra \ a_ra) + eps);
+    end
+end
+
+% 转dB并显示
+RA_mvdr_db = 10 * log10(RA_mvdr / max(RA_mvdr(:)) + eps);
+figure('Color', 'w');
+imagesc(ra_ang_scan, range_axis_ra, RA_mvdr_db);
+axis xy;
+colormap(jet);
+colorbar;
+caxis([-35 0]);
+xlabel('角度（°）');
+ylabel('距离（m）');
+title('第一帧 MVDR Range-Angle 图');
+ylim([0 5]);
+
 % 8元ULA，天线间距 d=λ/2：a(θ)=exp(-j*π*n*sin(θ))
 fc = 77e9;
 lambda = c / fc;
@@ -275,7 +335,14 @@ angle_fft_last2=zeros(1,numChirps);
 for i = 1:numChirps-1
     angle_fft_last2(i) = angle_fft_last(i+1) - angle_fft_last(i);
     angle_fft_last2(numChirps)=angle_fft_last(numChirps)-angle_fft_last(numChirps-1);
-end 
+end
+
+% 相位差分后轻量平滑（可开关）
+enable_phase_smooth = true;   % true: 开启平滑；false: 关闭平滑
+phase_smooth_win = 7;         % 平滑窗口长度（奇数，建议3~7）
+if enable_phase_smooth
+    angle_fft_last2 = movmean(angle_fft_last2, phase_smooth_win);
+end
 
 figure;
 plot(angle_fft_last2);
@@ -330,8 +397,8 @@ heart_data = filtfilt(b_heart, a_heart, angle_fft_last2);
 
 N1=length(heart_data);
 fshift = (-N1/2:N1/2-1)*(fs/N1); % zero-centered frequency
-heart_fre = abs(fftshift(fft(heart_data))); 
-figure;
+heart_fre = abs(fftshift(fft(heart_data)));
+figure(11);
 plot(fshift,heart_fre);
 xlabel('频率（f/Hz）');
 ylabel('幅度');
